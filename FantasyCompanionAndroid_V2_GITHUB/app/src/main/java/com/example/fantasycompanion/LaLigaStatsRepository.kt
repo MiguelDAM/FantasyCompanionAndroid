@@ -13,31 +13,97 @@ import java.text.Normalizer
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 
-/**
- * Consulta estadísticas públicas de LALIGA.
- *
- * Integración no oficial: la estructura de la API puede cambiar.
- */
 class LaLigaStatsRepository {
 
     companion object {
         private const val TAG = "FantasyAPI"
+
+        private const val PAGE_SIZE = 100
+        private const val MAX_OFFSET = 700
+
+        private const val CONNECT_TIMEOUT = 5000
+        private const val READ_TIMEOUT = 8000
+
+        private val SUBSCRIPTIONS = listOf(
+            "laliga-easports-2026",
+            "laliga-hypermotion-2026"
+        )
+
+        /*
+         * Fallback de la clave pública que ya estábamos utilizando.
+         * Si cambia, discoverApiKey() intentará obtenerla primero.
+         */
+        private const val FALLBACK_API_KEY =
+            "c13c3a8e2f6b46da9c5c425cf61fab3e"
     }
 
     private val main = Handler(Looper.getMainLooper())
-    private val cache = ConcurrentHashMap<String, PlayerStats>()
+
+    /*
+     * Resultado final ya convertido a PlayerStats.
+     */
+    private val statsCache =
+        ConcurrentHashMap<String, PlayerStats>()
+
+    /*
+     * Índice local:
+     *
+     * nombre normalizado -> JSONObject completo del jugador
+     *
+     * Cada página que descargamos se queda aquí.
+     * Así NO volvemos a recorrer internet para jugadores que
+     * ya hayan aparecido en páginas descargadas anteriormente.
+     */
+    private val playerIndex =
+        ConcurrentHashMap<String, JSONObject>()
+
+    /*
+     * Evita descargar la misma página más de una vez.
+     *
+     * Ejemplo:
+     * laliga-easports-2026:0
+     * laliga-easports-2026:100
+     */
+    private val loadedPages =
+        ConcurrentHashMap.newKeySet<String>()
+
+    /*
+     * Competiciones que sabemos que ya hemos recorrido completas.
+     */
+    private val exhaustedSubscriptions =
+        ConcurrentHashMap.newKeySet<String>()
+
+    /*
+     * Evita que dos jugadores distintos hagan simultáneamente
+     * la misma carga de páginas.
+     */
+    private val loadingLock = Any()
 
     @Volatile
     private var subscriptionKey: String? = null
 
-    fun get(playerName: String, callback: (PlayerStats) -> Unit) {
-        val key = normalize(playerName)
+    // ============================================================
+    // API PÚBLICA DEL REPOSITORIO
+    // ============================================================
 
-        cache[key]?.let {
+    fun get(
+        playerName: String,
+        callback: (PlayerStats) -> Unit
+    ) {
+        val normalized =
+            normalize(playerName)
+
+        /*
+         * 1. Resultado final ya conocido.
+         */
+        statsCache[normalized]?.let {
             callback(it)
             return
         }
 
+        /*
+         * Mostramos cargando inmediatamente.
+         */
         callback(
             PlayerStats(
                 playerName = playerName,
@@ -49,25 +115,36 @@ class LaLigaStatsRepository {
             name = "laliga-stats",
             isDaemon = true
         ) {
+
             val result = try {
-                fetchPlayer(playerName)
+
+                fetchPlayer(
+                    requestedName = playerName
+                )
+
             } catch (e: Exception) {
-                Log.e(TAG, "Error buscando a $playerName", e)
+
+                Log.e(
+                    TAG,
+                    "Error inesperado buscando $playerName",
+                    e
+                )
 
                 PlayerStats(
                     playerName = playerName,
-                    error = e.message ?: "Sin datos"
+                    error = e.message
+                        ?: "Error consultando LALIGA"
                 )
             }
 
+            /*
+             * Guardamos cualquier resultado válido.
+             */
             if (
-                result.goals != null ||
-                result.assists != null ||
-                result.yellowCards != null ||
-                result.redCards != null ||
-                result.cleanSheets != null
+                result.error == null &&
+                !result.loading
             ) {
-                cache[key] = result
+                statsCache[normalized] = result
             }
 
             main.post {
@@ -77,165 +154,389 @@ class LaLigaStatsRepository {
     }
 
     // ============================================================
-    // BÚSQUEDA DEL JUGADOR
+    // BÚSQUEDA
     // ============================================================
 
-    private fun fetchPlayer(playerName: String): PlayerStats {
-        val apiKey = subscriptionKey
-            ?: discoverApiKey().also { subscriptionKey = it }
+    private fun fetchPlayer(
+        requestedName: String
+    ): PlayerStats {
 
-        val target = normalize(playerName)
+        val target =
+            normalize(requestedName)
 
-        Log.d(TAG, "============================================")
-        Log.d(TAG, "BUSCANDO JUGADOR: $playerName")
-        Log.d(TAG, "NORMALIZADO: $target")
-
-        val subscriptions = listOf(
-            "laliga-easports-2026",
-            "laliga-hypermotion-2026"
+        Log.d(
+            TAG,
+            "========================================"
         )
 
-        for (subscription in subscriptions) {
+        Log.d(
+            TAG,
+            "BUSCANDO: '$requestedName' -> '$target'"
+        )
 
-            Log.d(TAG, "COMPETICIÓN: $subscription")
+        /*
+         * PRIMERO buscamos únicamente en memoria.
+         *
+         * Esto será instantáneo si el jugador apareció en
+         * alguna página descargada anteriormente.
+         */
+        findIndexedPlayer(target)?.let { obj ->
 
-            for (offset in 0..700 step 100) {
+            Log.d(
+                TAG,
+                "Jugador encontrado directamente en caché"
+            )
 
-                val url =
-                    "https://apim.laliga.com/public-service/api/v1/" +
-                    "subscriptions/$subscription/players/stats" +
-                    "?limit=100&offset=$offset"
+            return statsFromObject(
+                requestedName,
+                obj
+            )
+        }
 
-                val body = request(url, apiKey)
-                val root = parseAny(body)
+        /*
+         * Solo un hilo carga nuevas páginas a la vez.
+         */
+        synchronized(loadingLock) {
+
+            /*
+             * Otro hilo podría haberlo cargado mientras
+             * esperábamos el lock.
+             */
+            findIndexedPlayer(target)?.let { obj ->
+
+                return statsFromObject(
+                    requestedName,
+                    obj
+                )
+            }
+
+            val apiKey =
+                getApiKey()
+
+            var networkFailures = 0
+            var successfulRequests = 0
+
+            /*
+             * Primero Primera División.
+             * Solo pasamos a Segunda si no aparece.
+             */
+            for (subscription in SUBSCRIPTIONS) {
 
                 /*
-                 * La respuesta contiene muchos objetos anidados:
-                 * jugadores, clubes, stats individuales, metadata...
-                 *
-                 * NO podemos coger simplemente el primer objeto cuyo
-                 * "name" coincida.
+                 * Si esta competición ya fue cargada completamente,
+                 * no hacemos ninguna llamada.
                  */
-                val objects = collectObjects(root)
+                if (
+                    exhaustedSubscriptions.contains(
+                        subscription
+                    )
+                ) {
 
-                /*
-                 * Solo consideramos objetos que realmente parezcan
-                 * registros completos con estadísticas.
-                 */
-                val candidates = objects
-                    .filter { hasStatsContainer(it) }
-                    .mapNotNull { obj ->
-                        val candidateName = findPlayerName(obj)
-                            ?: return@mapNotNull null
-
-                        val score = namesMatchScore(
-                            target,
-                            normalize(candidateName)
+                    findIndexedPlayer(target)?.let {
+                        return statsFromObject(
+                            requestedName,
+                            it
                         )
-
-                        if (score > 0) {
-                            MatchCandidate(
-                                obj = obj,
-                                playerName = candidateName,
-                                score = score
-                            )
-                        } else {
-                            null
-                        }
                     }
-                    .sortedByDescending { it.score }
 
-                /*
-                 * IMPORTANTE:
-                 * ya no usamos firstOrNull().
-                 *
-                 * Elegimos la coincidencia con mayor puntuación.
-                 */
-                val match = candidates.firstOrNull()
+                    continue
+                }
 
-                if (match != null && match.score >= 70) {
+                Log.d(
+                    TAG,
+                    "Buscando en $subscription"
+                )
+
+                var subscriptionReachedEnd = false
+
+                for (
+                    offset in
+                    0..MAX_OFFSET step PAGE_SIZE
+                ) {
+
+                    val pageId =
+                        "$subscription:$offset"
+
+                    /*
+                     * Página ya descargada anteriormente.
+                     */
+                    if (
+                        loadedPages.contains(pageId)
+                    ) {
+
+                        findIndexedPlayer(target)?.let {
+
+                            Log.d(
+                                TAG,
+                                "Encontrado usando página ya cacheada: $pageId"
+                            )
+
+                            return statsFromObject(
+                                requestedName,
+                                it
+                            )
+                        }
+
+                        continue
+                    }
+
+                    val url =
+                        "https://apim.laliga.com/" +
+                        "public-service/api/v1/" +
+                        "subscriptions/$subscription/" +
+                        "players/stats" +
+                        "?limit=$PAGE_SIZE" +
+                        "&offset=$offset"
 
                     Log.d(
                         TAG,
-                        "MATCH: solicitado='$playerName' " +
-                            "API='${match.playerName}' " +
-                            "score=${match.score}"
+                        "Descargando página $pageId"
+                    )
+
+                    val body = try {
+
+                        requestWithRetry(
+                            url = url,
+                            apiKey = apiKey
+                        )
+
+                    } catch (e: Exception) {
+
+                        networkFailures++
+
+                        Log.w(
+                            TAG,
+                            "Fallo página $pageId: ${e.message}"
+                        )
+
+                        /*
+                         * No seguimos haciendo 7 peticiones más
+                         * si LALIGA está fallando ahora mismo.
+                         */
+                        break
+                    }
+
+                    successfulRequests++
+
+                    val root =
+                        parseAny(body)
+
+                    /*
+                     * Extraemos SOLO objetos que parecen
+                     * registros completos de jugador.
+                     */
+                    val players =
+                        extractPlayerObjects(root)
+
+                    Log.d(
+                        TAG,
+                        "Página $pageId: ${players.size} jugadores detectados"
                     )
 
                     /*
-                     * Log temporal para saber EXACTAMENTE qué objeto
-                     * devuelve LALIGA.
-                     *
-                     * Lo truncamos para evitar logs gigantes.
+                     * Índice permanente de la sesión.
                      */
-                    val jsonDebug = match.obj.toString()
+                    players.forEach {
+                        indexPlayer(it)
+                    }
 
-                    Log.d(
-                        TAG,
-                        "JSON MATCH: ${
-                            jsonDebug.take(3500)
-                        }"
+                    loadedPages.add(pageId)
+
+                    /*
+                     * Tras CADA página comprobamos el jugador.
+                     *
+                     * No esperamos a descargar 800 registros
+                     * si estaba en la primera página.
+                     */
+                    findIndexedPlayer(target)?.let {
+
+                        Log.d(
+                            TAG,
+                            "MATCH encontrado después de $pageId"
+                        )
+
+                        Log.d(
+                            TAG,
+                            "JSON MATCH: ${it.toString().take(2500)}"
+                        )
+
+                        return statsFromObject(
+                            requestedName,
+                            it
+                        )
+                    }
+
+                    /*
+                     * Si la API devuelve claramente menos que
+                     * PAGE_SIZE, probablemente hemos llegado al final.
+                     */
+                    if (
+                        players.isNotEmpty() &&
+                        players.size < PAGE_SIZE / 2
+                    ) {
+
+                        Log.d(
+                            TAG,
+                            "Fin aparente de $subscription en offset $offset"
+                        )
+
+                        subscriptionReachedEnd = true
+                        break
+                    }
+                }
+
+                /*
+                 * Marcamos como recorrida si llegamos al final
+                 * natural o ya hemos cargado el último offset.
+                 */
+                if (
+                    subscriptionReachedEnd ||
+                    loadedPages.contains(
+                        "$subscription:$MAX_OFFSET"
                     )
-
-                    return statsFromObject(
-                        requestedName = playerName,
-                        obj = match.obj
+                ) {
+                    exhaustedSubscriptions.add(
+                        subscription
                     )
                 }
 
-                if (candidates.isNotEmpty()) {
-                    Log.d(
-                        TAG,
-                        "Mejor candidato en offset $offset: " +
-                            "${candidates.first().playerName} " +
-                            "(${candidates.first().score})"
+                /*
+                 * Comprobación adicional después de cada liga.
+                 */
+                findIndexedPlayer(target)?.let {
+
+                    return statsFromObject(
+                        requestedName,
+                        it
                     )
                 }
             }
+
+            /*
+             * Diferenciamos claramente:
+             *
+             * - no respondió internet/API
+             * - sí respondió pero no encontramos al jugador
+             */
+            if (
+                networkFailures > 0 &&
+                successfulRequests == 0
+            ) {
+
+                return PlayerStats(
+                    playerName = requestedName,
+                    error = "LALIGA no responde. Inténtalo de nuevo."
+                )
+            }
+
+            Log.w(
+                TAG,
+                "Jugador no encontrado: $requestedName"
+            )
+
+            return PlayerStats(
+                playerName = requestedName,
+                error = "Jugador no encontrado"
+            )
+        }
+    }
+
+    // ============================================================
+    // ÍNDICE DE JUGADORES
+    // ============================================================
+
+    private fun indexPlayer(
+        obj: JSONObject
+    ) {
+
+        /*
+         * Guardamos todos los nombres/alias posibles.
+         *
+         * Ejemplo:
+         *
+         * Pedri
+         * Pedro González López
+         *
+         * pueden apuntar al mismo JSONObject.
+         */
+        collectPlayerAliases(obj)
+            .forEach { alias ->
+
+                val key =
+                    normalize(alias)
+
+                if (key.length >= 3) {
+
+                    playerIndex.putIfAbsent(
+                        key,
+                        obj
+                    )
+                }
+            }
+    }
+
+    private fun findIndexedPlayer(
+        target: String
+    ): JSONObject? {
+
+        /*
+         * Coincidencia exacta: instantánea.
+         */
+        playerIndex[target]?.let {
+            return it
         }
 
-        Log.w(
+        /*
+         * Coincidencia aproximada.
+         *
+         * Recorremos SOLO el índice en memoria,
+         * no internet.
+         */
+        var bestObject: JSONObject? = null
+        var bestScore = 0
+
+        for (
+            (candidateName, obj)
+            in playerIndex
+        ) {
+
+            val score =
+                namesMatchScore(
+                    target,
+                    candidateName
+                )
+
+            if (score > bestScore) {
+                bestScore = score
+                bestObject = obj
+            }
+        }
+
+        Log.d(
             TAG,
-            "Jugador no encontrado: $playerName"
+            "Mejor coincidencia en índice: score=$bestScore"
         )
 
-        return PlayerStats(
-            playerName = playerName,
-            error = "Jugador no encontrado"
-        )
+        /*
+         * 75 mantiene soporte para jugadores conocidos
+         * por un solo nombre: Pedri, Gavi, Raphinha...
+         */
+        return if (
+            bestScore >= 75
+        ) {
+            bestObject
+        } else {
+            null
+        }
     }
 
-    private data class MatchCandidate(
-        val obj: JSONObject,
-        val playerName: String,
-        val score: Int
-    )
+    private fun collectPlayerAliases(
+        obj: JSONObject
+    ): Set<String> {
 
-    // ============================================================
-    // DETECCIÓN DE OBJETOS DE JUGADOR
-    // ============================================================
+        val aliases =
+            linkedSetOf<String>()
 
-    private fun hasStatsContainer(obj: JSONObject): Boolean {
-        val stats = realValue(obj, "stats")
-        val statistics = realValue(obj, "statistics")
-
-        return stats is JSONArray ||
-            stats is JSONObject ||
-            statistics is JSONArray ||
-            statistics is JSONObject
-    }
-
-    /**
-     * Primero buscamos el nombre dentro de person/player.
-     *
-     * Esto es importante porque un objeto puede contener:
-     *
-     * name = nombre del club
-     * person.name = nombre del jugador
-     *
-     * y antes estábamos dando prioridad al name genérico.
-     */
-    private fun findPlayerName(obj: JSONObject): String? {
         val keys = listOf(
             "nickname",
             "display_name",
@@ -244,23 +545,273 @@ class LaLigaStatsRepository {
             "name"
         )
 
-        val person = obj.optJSONObject("person")
+        fun collect(
+            source: JSONObject?
+        ) {
 
-        if (person != null) {
-            findNameInside(person, keys)?.let {
-                return it
+            if (source == null) {
+                return
+            }
+
+            for (key in keys) {
+
+                val value =
+                    source
+                        .optString(key, "")
+                        .trim()
+
+                if (
+                    value.length in 3..70 &&
+                    value.any(Char::isLetter)
+                ) {
+                    aliases.add(value)
+                }
             }
         }
 
-        val player = obj.optJSONObject("player")
+        /*
+         * Las estructuras específicas de jugador tienen prioridad.
+         */
+        collect(
+            obj.optJSONObject("person")
+        )
 
-        if (player != null) {
-            findNameInside(player, keys)?.let {
-                return it
+        collect(
+            obj.optJSONObject("player")
+        )
+
+        /*
+         * Después los campos del registro principal.
+         */
+        collect(obj)
+
+        return aliases
+    }
+
+    // ============================================================
+    // EXTRAER REGISTROS REALES DE JUGADOR
+    // ============================================================
+
+    private fun extractPlayerObjects(
+        root: Any?
+    ): List<JSONObject> {
+
+        val result =
+            mutableListOf<JSONObject>()
+
+        val seen =
+            HashSet<String>()
+
+        fun walk(
+            value: Any?,
+            depth: Int
+        ) {
+
+            /*
+             * Evitamos recorrer árboles JSON absurdamente profundos.
+             */
+            if (depth > 8) {
+                return
+            }
+
+            when (value) {
+
+                is JSONObject -> {
+
+                    /*
+                     * Solo aceptamos objetos con:
+                     *
+                     * - nombre de jugador
+                     * - stats/statistics
+                     *
+                     * Esto mantiene la corrección que eliminó
+                     * los falsos equipos.
+                     */
+                    if (
+                        hasStatsContainer(value) &&
+                        findPlayerName(value) != null
+                    ) {
+
+                        /*
+                         * Intentamos deduplicar por ID,
+                         * y como fallback por nombre.
+                         */
+                        val identity =
+                            extractPlayerId(value)
+                                ?: normalize(
+                                    findPlayerName(value)
+                                        ?: value.toString()
+                                )
+
+                        if (
+                            seen.add(identity)
+                        ) {
+                            result.add(value)
+                        }
+
+                        /*
+                         * Si ya es un registro de jugador,
+                         * no hace falta entrar en stats[] y
+                         * analizar cientos de objetos estadísticos.
+                         *
+                         * ESTA optimización es importante.
+                         */
+                        return
+                    }
+
+                    value
+                        .keys()
+                        .forEachRemaining { key ->
+
+                            walk(
+                                value.opt(key),
+                                depth + 1
+                            )
+                        }
+                }
+
+                is JSONArray -> {
+
+                    for (
+                        i in 0 until value.length()
+                    ) {
+
+                        walk(
+                            value.opt(i),
+                            depth + 1
+                        )
+                    }
+                }
             }
         }
 
-        return findNameInside(obj, keys)
+        walk(
+            root,
+            0
+        )
+
+        return result
+    }
+
+    private fun extractPlayerId(
+        obj: JSONObject
+    ): String? {
+
+        val keys = listOf(
+            "opta_id",
+            "optaId",
+            "player_id",
+            "playerId",
+            "id"
+        )
+
+        /*
+         * Primero estructuras específicas del jugador.
+         */
+        val containers = listOfNotNull(
+            obj.optJSONObject("person"),
+            obj.optJSONObject("player"),
+            obj
+        )
+
+        for (container in containers) {
+
+            for (key in keys) {
+
+                val raw =
+                    realValue(
+                        container,
+                        key
+                    ) ?: continue
+
+                val text =
+                    raw.toString()
+                        .trim()
+
+                if (text.isNotBlank()) {
+                    return "$key:$text"
+                }
+            }
+        }
+
+        return null
+    }
+
+    private fun hasStatsContainer(
+        obj: JSONObject
+    ): Boolean {
+
+        val stats =
+            realValue(
+                obj,
+                "stats"
+            )
+
+        val statistics =
+            realValue(
+                obj,
+                "statistics"
+            )
+
+        return stats is JSONArray ||
+            stats is JSONObject ||
+            statistics is JSONArray ||
+            statistics is JSONObject
+    }
+
+    // ============================================================
+    // NOMBRE DEL JUGADOR
+    // ============================================================
+
+    private fun findPlayerName(
+        obj: JSONObject
+    ): String? {
+
+        val keys = listOf(
+            "nickname",
+            "display_name",
+            "player_name",
+            "full_name",
+            "name"
+        )
+
+        /*
+         * Primero PERSON.
+         */
+        obj
+            .optJSONObject("person")
+            ?.let { person ->
+
+                findNameInside(
+                    person,
+                    keys
+                )?.let {
+                    return it
+                }
+            }
+
+        /*
+         * Después PLAYER.
+         */
+        obj
+            .optJSONObject("player")
+            ?.let { player ->
+
+                findNameInside(
+                    player,
+                    keys
+                )?.let {
+                    return it
+                }
+            }
+
+        /*
+         * Finalmente raíz.
+         */
+        return findNameInside(
+            obj,
+            keys
+        )
     }
 
     private fun findNameInside(
@@ -270,11 +821,13 @@ class LaLigaStatsRepository {
 
         for (key in keys) {
 
-            val value = obj.optString(key, "")
-                .trim()
+            val value =
+                obj
+                    .optString(key, "")
+                    .trim()
 
             if (
-                value.length in 3..60 &&
+                value.length in 3..70 &&
                 value.any(Char::isLetter)
             ) {
                 return value
@@ -288,15 +841,6 @@ class LaLigaStatsRepository {
     // COMPARACIÓN DE NOMBRES
     // ============================================================
 
-    /**
-     * Devuelve una puntuación.
-     *
-     * 100 = nombre exacto
-     * 90  = uno contiene completamente al otro
-     * 70+ = coincidencia fuerte de palabras
-     *
-     * Una coincidencia débil ya NO basta para escoger jugador.
-     */
     private fun namesMatchScore(
         requested: String,
         candidate: String
@@ -309,38 +853,41 @@ class LaLigaStatsRepository {
             return 0
         }
 
-        if (requested == candidate) {
+        if (
+            requested == candidate
+        ) {
             return 100
         }
 
         /*
-         * Ejemplo:
-         *
-         * "robert lewandowski"
-         * "lewandowski"
+         * Robert Lewandowski ↔ Lewandowski
          */
         if (
             requested.length >= 5 &&
-            candidate.length >= 5
-        ) {
-
-            if (
+            candidate.length >= 5 &&
+            (
                 requested.contains(candidate) ||
                 candidate.contains(requested)
-            ) {
-                return 90
-            }
+            )
+        ) {
+            return 90
         }
 
-        val requestedWords = requested
-            .split(' ')
-            .filter { it.length > 2 }
-            .toSet()
+        val requestedWords =
+            requested
+                .split(' ')
+                .filter {
+                    it.length > 2
+                }
+                .toSet()
 
-        val candidateWords = candidate
-            .split(' ')
-            .filter { it.length > 2 }
-            .toSet()
+        val candidateWords =
+            candidate
+                .split(' ')
+                .filter {
+                    it.length > 2
+                }
+                .toSet()
 
         if (
             requestedWords.isEmpty() ||
@@ -349,28 +896,39 @@ class LaLigaStatsRepository {
             return 0
         }
 
-        val common = requestedWords
-            .intersect(candidateWords)
+        val common =
+            requestedWords
+                .intersect(
+                    candidateWords
+                )
 
         /*
-         * Para nombres de varias palabras exigimos
-         * al menos dos coincidencias cuando sea posible.
+         * Dos nombres de varias palabras:
+         * exigimos al menos dos coincidencias.
          */
         if (
             requestedWords.size >= 2 &&
             candidateWords.size >= 2
         ) {
 
-            if (common.size >= 2) {
-                return 80 + minOf(common.size, 3)
-            }
+            return if (
+                common.size >= 2
+            ) {
 
-            return 0
+                80 +
+                    minOf(
+                        common.size,
+                        3
+                    )
+
+            } else {
+
+                0
+            }
         }
 
         /*
-         * Jugadores conocidos por un único nombre:
-         * Pedri, Gavi, Raphinha...
+         * Pedri / Gavi / Raphinha...
          */
         if (
             common.isNotEmpty() &&
@@ -386,7 +944,7 @@ class LaLigaStatsRepository {
     }
 
     // ============================================================
-    // CONVERSIÓN DEL JSON A PlayerStats
+    // ESTADÍSTICAS
     // ============================================================
 
     private fun statsFromObject(
@@ -394,116 +952,136 @@ class LaLigaStatsRepository {
         obj: JSONObject
     ): PlayerStats {
 
-        val stats = mutableMapOf<String, Int>()
+        val stats =
+            mutableMapOf<String, Int>()
 
-        fun consumeStats(container: Any?) {
+        fun consumeStats(
+            container: Any?
+        ) {
 
             when (container) {
 
                 is JSONArray -> {
 
-                    for (i in 0 until container.length()) {
+                    for (
+                        i in
+                        0 until container.length()
+                    ) {
 
                         val statObject =
-                            container.optJSONObject(i)
+                            container
+                                .optJSONObject(i)
                                 ?: continue
 
-                        val key = extractStatKey(statObject)
-                            ?: continue
+                        val pair =
+                            extractStatPair(
+                                statObject
+                            )
+                                ?: continue
 
-                        val raw = firstRealValue(
-                            statObject,
-                            "value",
-                            "total",
-                            "stat_value",
-                            "stat",
-                            "amount",
-                            "count"
-                        )
-
-                        val number = toIntOrNull(raw)
+                        stats[
+                            normalizeStatKey(
+                                pair.first
+                            )
+                        ] = pair.second
 
                         Log.d(
                             TAG,
-                            "STAT JSON: key='$key' raw='$raw' number=$number"
+                            "STAT ${pair.first}=${pair.second}"
                         )
-
-                        if (number != null) {
-                            stats[normalizeStatKey(key)] = number
-                        }
                     }
                 }
 
                 is JSONObject -> {
 
-                    container.keys().forEachRemaining { key ->
+                    container
+                        .keys()
+                        .forEachRemaining { key ->
 
-                        val raw = container.opt(key)
+                            val value =
+                                realValue(
+                                    container,
+                                    key
+                                )
 
-                        if (
-                            raw == null ||
-                            raw === JSONObject.NULL
-                        ) {
-                            return@forEachRemaining
+                            val number =
+                                toIntOrNull(
+                                    value
+                                )
+
+                            if (
+                                number != null
+                            ) {
+
+                                stats[
+                                    normalizeStatKey(
+                                        key
+                                    )
+                                ] = number
+                            }
                         }
-
-                        val number = toIntOrNull(raw)
-
-                        if (number != null) {
-                            stats[
-                                normalizeStatKey(key)
-                            ] = number
-                        }
-                    }
                 }
             }
         }
 
         consumeStats(
-            realValue(obj, "stats")
+            realValue(
+                obj,
+                "stats"
+            )
         )
 
         consumeStats(
-            realValue(obj, "statistics")
+            realValue(
+                obj,
+                "statistics"
+            )
         )
 
         /*
-         * También permitimos estadísticas directamente
-         * en el objeto raíz.
+         * Algunos esquemas podrían exponer campos directos.
          */
-        obj.keys().forEachRemaining { key ->
+        obj
+            .keys()
+            .forEachRemaining { key ->
 
-            val raw = obj.opt(key)
+                val raw =
+                    realValue(
+                        obj,
+                        key
+                    )
 
-            if (
-                raw == null ||
-                raw === JSONObject.NULL
-            ) {
-                return@forEachRemaining
+                val number =
+                    toIntOrNull(
+                        raw
+                    )
+
+                if (
+                    number != null
+                ) {
+
+                    stats.putIfAbsent(
+                        normalizeStatKey(key),
+                        number
+                    )
+                }
             }
-
-            val number = toIntOrNull(raw)
-
-            if (number != null) {
-
-                stats.putIfAbsent(
-                    normalizeStatKey(key),
-                    number
-                )
-            }
-        }
 
         Log.d(
             TAG,
-            "STATS ENCONTRADAS PARA $requestedName: $stats"
+            "STATS $requestedName -> $stats"
         )
 
-        fun get(vararg keys: String): Int? {
+        fun get(
+            vararg keys: String
+        ): Int? {
 
             for (key in keys) {
 
                 stats[
-                    normalizeStatKey(key)
+                    normalizeStatKey(
+                        key
+                    )
                 ]?.let {
                     return it
                 }
@@ -512,7 +1090,7 @@ class LaLigaStatsRepository {
             return null
         }
 
-        val result = PlayerStats(
+        return PlayerStats(
 
             playerName =
                 findPlayerName(obj)
@@ -554,236 +1132,300 @@ class LaLigaStatsRepository {
 
             source = "LALIGA"
         )
-
-        Log.d(
-            TAG,
-            "RESULTADO FINAL: $result"
-        )
-
-        return result
     }
 
-    // ============================================================
-    // EXTRACCIÓN ROBUSTA DE ESTADÍSTICAS
-    // ============================================================
-
     /**
-     * Intenta localizar el nombre de la estadística.
+     * Soporta varias formas:
      *
-     * "stat" NO se usa directamente aquí porque en algunos
-     * esquemas puede ser el VALOR numérico de la estadística.
+     * {
+     *   "name": "goals",
+     *   "value": 3
+     * }
+     *
+     * o:
+     *
+     * {
+     *   "name": "goals",
+     *   "stat": 3
+     * }
+     *
+     * o:
+     *
+     * {
+     *   "stat": "goals",
+     *   "value": 3
+     * }
      */
-    private fun extractStatKey(
+    private fun extractStatPair(
         obj: JSONObject
-    ): String? {
+    ): Pair<String, Int>? {
 
-        val possibleKeys = listOf(
-            "name",
-            "key",
-            "stat_name",
-            "statName",
-            "type",
-            "code"
-        )
+        val keyFields =
+            listOf(
+                "name",
+                "key",
+                "stat_name",
+                "statName",
+                "type",
+                "code"
+            )
 
-        for (key in possibleKeys) {
+        var statName: String? = null
 
-            val raw = realValue(
-                obj,
-                key
-            ) ?: continue
+        for (key in keyFields) {
 
-            if (raw is String) {
-
-                val value = raw.trim()
-
-                if (
-                    value.isNotBlank() &&
-                    value.any(Char::isLetter)
-                ) {
-                    return value
-                }
-            }
-        }
-
-        /*
-         * Como último recurso, "stat" puede ser el nombre
-         * si realmente contiene texto.
-         */
-        val stat = realValue(
-            obj,
-            "stat"
-        )
-
-        if (
-            stat is String &&
-            stat.any(Char::isLetter)
-        ) {
-            return stat
-        }
-
-        return null
-    }
-
-    /**
-     * Devuelve el primer valor REAL.
-     *
-     * JSONObject.NULL != null en Kotlin.
-     *
-     * Este era uno de los problemas de la implementación
-     * anterior.
-     */
-    private fun firstRealValue(
-        obj: JSONObject,
-        vararg keys: String
-    ): Any? {
-
-        for (key in keys) {
-
-            if (!obj.has(key)) {
-                continue
-            }
-
-            val value = obj.opt(key)
+            val raw =
+                realValue(
+                    obj,
+                    key
+                )
 
             if (
-                value != null &&
-                value !== JSONObject.NULL
+                raw is String &&
+                raw.any(Char::isLetter)
             ) {
-                return value
+
+                statName =
+                    raw.trim()
+
+                break
             }
         }
 
-        return null
-    }
+        val rawStat =
+            realValue(
+                obj,
+                "stat"
+            )
 
-    private fun realValue(
-        obj: JSONObject,
-        key: String
-    ): Any? {
+        /*
+         * stat puede ser NOMBRE...
+         */
+        if (
+            statName == null &&
+            rawStat is String &&
+            rawStat.any(Char::isLetter)
+        ) {
+            statName =
+                rawStat.trim()
+        }
 
-        if (!obj.has(key)) {
+        if (
+            statName == null
+        ) {
             return null
         }
 
-        val value = obj.opt(key)
-
-        return if (
-            value == null ||
-            value === JSONObject.NULL
-        ) {
-            null
-        } else {
-            value
-        }
-    }
-
-    private fun toIntOrNull(
-        value: Any?
-    ): Int? {
-
-        return when (value) {
-
-            is Byte ->
-                value.toInt()
-
-            is Short ->
-                value.toInt()
-
-            is Int ->
-                value
-
-            is Long ->
-                value.toInt()
-
-            is Float ->
-                value.toInt()
-
-            is Double ->
-                value.toInt()
-
-            is Number ->
-                value.toInt()
-
-            is String ->
-                value
-                    .replace(",", ".")
-                    .trim()
-                    .toDoubleOrNull()
-                    ?.toInt()
-
-            else ->
-                null
-        }
-    }
-
-    // ============================================================
-    // HTTP / API
-    // ============================================================
-
-    private fun discoverApiKey(): String {
-
-        val pages = listOf(
-            "https://www.laliga.com/",
-            "https://www.laliga.com/laliga-easports"
-        )
-
-        val regexes = listOf(
-
-            Regex(
-                "backendSubscription[\\\"']?\\s*[:=]\\s*[\\\"']" +
-                    "([a-fA-F0-9]{24,64})"
-            ),
-
-            Regex(
-                "Ocp-Apim-Subscription-Key[\\\"']?\\s*[:=]\\s*[\\\"']" +
-                    "([a-fA-F0-9]{24,64})"
-            )
-        )
-
-        for (page in pages) {
-
-            val html = request(
-                page,
-                null
+        /*
+         * ...o puede ser VALOR.
+         */
+        val possibleValues =
+            listOf(
+                realValue(
+                    obj,
+                    "value"
+                ),
+                realValue(
+                    obj,
+                    "total"
+                ),
+                realValue(
+                    obj,
+                    "stat_value"
+                ),
+                realValue(
+                    obj,
+                    "amount"
+                ),
+                realValue(
+                    obj,
+                    "count"
+                ),
+                rawStat
             )
 
-            for (regex in regexes) {
+        for (raw in possibleValues) {
 
-                regex
-                    .find(html)
-                    ?.groupValues
-                    ?.getOrNull(1)
-                    ?.let {
-                        Log.d(
-                            TAG,
-                            "API key detectada dinámicamente"
-                        )
+            val number =
+                toIntOrNull(
+                    raw
+                )
 
-                        return it
-                    }
+            if (
+                number != null
+            ) {
+
+                return Pair(
+                    statName,
+                    number
+                )
             }
         }
 
-        /*
-         * Fallback actual.
-         * Puede rotar en cualquier momento.
-         */
-        return "c13c3a8e2f6b46da9c5c425cf61fab3e"
+        return null
     }
 
-    private fun request(
+    // ============================================================
+    // API KEY
+    // ============================================================
+
+    private fun getApiKey(): String {
+
+        subscriptionKey?.let {
+            return it
+        }
+
+        val discovered = try {
+
+            discoverApiKey()
+
+        } catch (e: Exception) {
+
+            Log.w(
+                TAG,
+                "No se pudo descubrir API key: ${e.message}"
+            )
+
+            null
+        }
+
+        val key =
+            discovered
+                ?: FALLBACK_API_KEY
+
+        subscriptionKey = key
+
+        return key
+    }
+
+    private fun discoverApiKey(): String? {
+
+        /*
+         * Solo probamos una página para no añadir
+         * varios timeouts antes incluso de consultar jugadores.
+         */
+        val html =
+            requestOnce(
+                url =
+                    "https://www.laliga.com/",
+                apiKey = null,
+                connectTimeout = 3500,
+                readTimeout = 5000
+            )
+
+        val regexes =
+            listOf(
+
+                Regex(
+                    "backendSubscription" +
+                        "[\\\"']?\\s*[:=]\\s*" +
+                        "[\\\"']" +
+                        "([a-fA-F0-9]{24,64})"
+                ),
+
+                Regex(
+                    "Ocp-Apim-Subscription-Key" +
+                        "[\\\"']?\\s*[:=]\\s*" +
+                        "[\\\"']" +
+                        "([a-fA-F0-9]{24,64})"
+                )
+            )
+
+        for (regex in regexes) {
+
+            regex
+                .find(html)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.let {
+
+                    Log.d(
+                        TAG,
+                        "API key descubierta"
+                    )
+
+                    return it
+                }
+        }
+
+        return null
+    }
+
+    // ============================================================
+    // HTTP
+    // ============================================================
+
+    private fun requestWithRetry(
         url: String,
         apiKey: String?
     ): String {
 
+        var lastError:
+            Exception? = null
+
+        /*
+         * Máximo DOS intentos.
+         *
+         * Nada de quedarse indefinidamente cargando.
+         */
+        repeat(2) { attempt ->
+
+            try {
+
+                return requestOnce(
+                    url = url,
+                    apiKey = apiKey,
+                    connectTimeout =
+                        CONNECT_TIMEOUT,
+                    readTimeout =
+                        READ_TIMEOUT
+                )
+
+            } catch (e: Exception) {
+
+                lastError = e
+
+                Log.w(
+                    TAG,
+                    "Petición fallida intento ${attempt + 1}/2: ${e.message}"
+                )
+
+                if (attempt == 0) {
+
+                    try {
+                        Thread.sleep(300)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+            }
+        }
+
+        throw lastError
+            ?: IllegalStateException(
+                "Error de conexión"
+            )
+    }
+
+    private fun requestOnce(
+        url: String,
+        apiKey: String?,
+        connectTimeout: Int,
+        readTimeout: Int
+    ): String {
+
         val connection =
-            URL(url).openConnection()
+            URL(url)
+                .openConnection()
                 as HttpURLConnection
 
-        connection.connectTimeout = 10000
-        connection.readTimeout = 15000
-        connection.requestMethod = "GET"
+        connection.connectTimeout =
+            connectTimeout
+
+        connection.readTimeout =
+            readTimeout
+
+        connection.requestMethod =
+            "GET"
 
         connection.setRequestProperty(
             "Accept",
@@ -792,10 +1434,12 @@ class LaLigaStatsRepository {
 
         connection.setRequestProperty(
             "User-Agent",
-            "Mozilla/5.0 (Android) FantasyCompanion/0.3"
+            "Mozilla/5.0 (Android) FantasyCompanion/0.4"
         )
 
-        if (apiKey != null) {
+        if (
+            apiKey != null
+        ) {
 
             connection.setRequestProperty(
                 "Ocp-Apim-Subscription-Key",
@@ -809,27 +1453,40 @@ class LaLigaStatsRepository {
                 connection.responseCode
 
             val stream =
-                if (code in 200..299) {
+                if (
+                    code in 200..299
+                ) {
+
                     connection.inputStream
+
                 } else {
+
                     connection.errorStream
                 }
 
             val text =
-                BufferedReader(
-                    InputStreamReader(stream)
-                ).use {
-                    it.readText()
+                if (
+                    stream != null
+                ) {
+
+                    BufferedReader(
+                        InputStreamReader(
+                            stream
+                        )
+                    ).use {
+                        it.readText()
+                    }
+
+                } else {
+
+                    ""
                 }
 
-            if (code !in 200..299) {
+            if (
+                code !in 200..299
+            ) {
 
-                Log.e(
-                    TAG,
-                    "HTTP $code -> $url"
-                )
-
-                error(
+                throw IllegalStateException(
                     "LALIGA HTTP $code"
                 )
             }
@@ -850,58 +1507,64 @@ class LaLigaStatsRepository {
         text: String
     ): Any {
 
-        return when {
+        val trimmed =
+            text.trimStart()
 
-            text
-                .trimStart()
-                .startsWith("[") ->
-                JSONArray(text)
+        if (
+            trimmed.startsWith("[")
+        ) {
+            return JSONArray(text)
+        }
 
-            else ->
-                JSONObject(text)
+        return JSONObject(text)
+    }
+
+    private fun realValue(
+        obj: JSONObject,
+        key: String
+    ): Any? {
+
+        if (
+            !obj.has(key)
+        ) {
+            return null
+        }
+
+        val value =
+            obj.opt(key)
+
+        return if (
+            value == null ||
+            value === JSONObject.NULL
+        ) {
+
+            null
+
+        } else {
+
+            value
         }
     }
 
-    /**
-     * Recorremos la respuesta para encontrar registros.
-     *
-     * Después filtramos estrictamente para aceptar únicamente
-     * objetos que tengan stats/statistics.
-     */
-    private fun collectObjects(
+    private fun toIntOrNull(
         value: Any?
-    ): List<JSONObject> {
+    ): Int? {
 
-        val out =
-            mutableListOf<JSONObject>()
+        return when (value) {
 
-        fun walk(v: Any?) {
+            is Number ->
+                value.toInt()
 
-            when (v) {
+            is String ->
+                value
+                    .replace(",", ".")
+                    .trim()
+                    .toDoubleOrNull()
+                    ?.toInt()
 
-                is JSONObject -> {
-
-                    out += v
-
-                    v.keys().forEachRemaining { key ->
-                        walk(v.opt(key))
-                    }
-                }
-
-                is JSONArray -> {
-
-                    for (
-                        i in 0 until v.length()
-                    ) {
-                        walk(v.opt(i))
-                    }
-                }
-            }
+            else ->
+                null
         }
-
-        walk(value)
-
-        return out
     }
 
     // ============================================================
