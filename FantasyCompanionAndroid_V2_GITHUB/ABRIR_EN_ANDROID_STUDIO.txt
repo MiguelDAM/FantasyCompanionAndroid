@@ -1,0 +1,11 @@
+ABRE ESTA CARPETA EN ANDROID STUDIO.
+
+En la raíz debes ver directamente:
+- app/
+- build.gradle.kts
+- settings.gradle.kts
+- gradle.properties
+
+Android Studio: File > Open > selecciona esta carpeta.
+Después: File > Sync Project with Gradle Files.
+Cuando termine la sincronización, la configuración "app" debe aparecer en Run.
