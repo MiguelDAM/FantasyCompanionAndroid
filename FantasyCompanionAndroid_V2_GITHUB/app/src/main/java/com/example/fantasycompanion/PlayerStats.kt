@@ -7,6 +7,8 @@ data class PlayerStats(
     val yellowCards: Int? = null,
     val redCards: Int? = null,
     val cleanSheets: Int? = null,
+    val teamName: String? = null,
+    val competition: String? = null,
     val source: String? = null,
     val loading: Boolean = false,
     val error: String? = null
