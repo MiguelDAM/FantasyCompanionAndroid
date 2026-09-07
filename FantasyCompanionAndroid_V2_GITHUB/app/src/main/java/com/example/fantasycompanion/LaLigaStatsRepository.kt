@@ -165,7 +165,7 @@ class LaLigaStatsRepository {
                 .distinctBy {
                     normalize(it)
                 }
-                .take(8)
+                .take(24)
 
         if (
             candidates.isEmpty()
