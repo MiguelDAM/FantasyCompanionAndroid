@@ -15,33 +15,49 @@ class OverlayController(
 ) {
 
     private val windowManager =
-        service.getSystemService(WindowManager::class.java)
+        service.getSystemService(
+            WindowManager::class.java
+        )
 
-    private var card: LinearLayout? = null
+    private var card:
+        LinearLayout? = null
 
-    private var titleView: TextView? = null
-    private var competitionView: TextView? = null
-    private var nameView: TextView? = null
-    private var statsView: TextView? = null
-    private var statusView: TextView? = null
+    private var leagueView:
+        TextView? = null
 
-    fun show(stats: PlayerStats) {
+    private var nameView:
+        TextView? = null
 
-        if (card == null) {
+    private var statsView:
+        TextView? = null
+
+    private var statusView:
+        TextView? = null
+
+    fun show(
+        stats: PlayerStats
+    ) {
+
+        if (
+            card == null
+        ) {
+
             createCard()
         }
 
         nameView?.text =
             stats.playerName
 
-        competitionView?.text =
-            when (stats.competition) {
-
-                "LALIGA EA SPORTS" ->
-                    "LALIGA EA SPORTS"
+        leagueView?.text =
+            when (
+                stats.competition
+            ) {
 
                 "LALIGA HYPERMOTION" ->
-                    "LALIGA HYPERMOTION"
+                    "HYPERMOTION"
+
+                "LALIGA EA SPORTS" ->
+                    "EA SPORTS"
 
                 else ->
                     "LALIGA"
@@ -56,49 +72,65 @@ class OverlayController(
                 ?: "—"
         }
 
+        /*
+         * Dos líneas para reducir mucho el ancho.
+         */
         statsView?.text =
             buildString {
 
                 append("⚽ ")
-                append(value(stats.goals))
+                append(
+                    value(
+                        stats.goals
+                    )
+                )
 
                 append("   🅰 ")
-                append(value(stats.assists))
+                append(
+                    value(
+                        stats.assists
+                    )
+                )
 
                 append("   🟨 ")
-                append(value(stats.yellowCards))
+                append(
+                    value(
+                        stats.yellowCards
+                    )
+                )
 
-                append("   🟥 ")
-                append(value(stats.redCards))
+                append("\n")
+
+                append("🟥 ")
+                append(
+                    value(
+                        stats.redCards
+                    )
+                )
 
                 append("   🧤 ")
-                append(value(stats.cleanSheets))
+                append(
+                    value(
+                        stats.cleanSheets
+                    )
+                )
             }
 
         statusView?.text =
             when {
 
                 stats.loading ->
-                    "Identificando jugador…"
+                    "Buscando estadísticas…"
 
                 stats.error != null ->
-                    "⚠ ${stats.error}"
+                    "⚠ Datos no disponibles"
 
-                else -> {
+                !stats.teamName
+                    .isNullOrBlank() ->
+                    stats.teamName
 
-                    listOfNotNull(
-                        stats.teamName
-                            ?.takeIf {
-                                it.isNotBlank()
-                            },
-
-                        stats.source
-                            ?.takeIf {
-                                it.isNotBlank()
-                            }
-                    )
-                        .joinToString("  ·  ")
-                }
+                else ->
+                    "Datos LALIGA"
             }
     }
 
@@ -118,12 +150,20 @@ class OverlayController(
             }
         }
 
-        card = null
-        titleView = null
-        competitionView = null
-        nameView = null
-        statsView = null
-        statusView = null
+        card =
+            null
+
+        leagueView =
+            null
+
+        nameView =
+            null
+
+        statsView =
+            null
+
+        statusView =
+            null
     }
 
     private fun createCard() {
@@ -153,10 +193,10 @@ class OverlayController(
                     LinearLayout.VERTICAL
 
                 setPadding(
-                    dp(12),
-                    dp(8),
-                    dp(12),
-                    dp(8)
+                    dp(10),
+                    dp(7),
+                    dp(10),
+                    dp(7)
                 )
 
                 setBackgroundResource(
@@ -164,41 +204,18 @@ class OverlayController(
                 )
 
                 elevation =
-                    dp(12)
+                    dp(8)
                         .toFloat()
 
                 minimumWidth =
-                    dp(190)
+                    dp(145)
             }
 
-        val title =
-            TextView(
-                service
-            ).apply {
-
-                text =
-                    "FANTASY COMPANION"
-
-                textSize =
-                    9f
-
-                setTextColor(
-                    Color.WHITE
-                )
-
-                alpha =
-                    0.60f
-
-                letterSpacing =
-                    0.08f
-
-                setTypeface(
-                    typeface,
-                    Typeface.BOLD
-                )
-            }
-
-        val competition =
+        /*
+         * Fila superior pequeña:
+         * FC · EA SPORTS
+         */
+        val league =
             TextView(
                 service
             ).apply {
@@ -207,7 +224,7 @@ class OverlayController(
                     "LALIGA"
 
                 textSize =
-                    9.5f
+                    8.5f
 
                 setTextColor(
                     Color.parseColor(
@@ -220,12 +237,8 @@ class OverlayController(
                     Typeface.BOLD
                 )
 
-                setPadding(
-                    0,
-                    dp(1),
-                    0,
-                    dp(2)
-                )
+                letterSpacing =
+                    0.07f
             }
 
         val name =
@@ -234,10 +247,10 @@ class OverlayController(
             ).apply {
 
                 text =
-                    "Identificando jugador…"
+                    "Jugador"
 
                 textSize =
-                    15f
+                    13.5f
 
                 setTextColor(
                     Color.WHITE
@@ -249,13 +262,20 @@ class OverlayController(
                 )
 
                 maxWidth =
-                    dp(235)
+                    dp(175)
 
                 maxLines =
                     1
 
                 ellipsize =
                     TextUtils.TruncateAt.END
+
+                setPadding(
+                    0,
+                    dp(1),
+                    0,
+                    0
+                )
             }
 
         val stats =
@@ -264,10 +284,10 @@ class OverlayController(
             ).apply {
 
                 text =
-                    "⚽ —   🅰 —   🟨 —   🟥 —   🧤 —"
+                    "⚽ —   🅰 —   🟨 —\n🟥 —   🧤 —"
 
                 textSize =
-                    12.5f
+                    11.5f
 
                 setTextColor(
                     Color.WHITE
@@ -275,13 +295,13 @@ class OverlayController(
 
                 setPadding(
                     0,
-                    dp(5),
+                    dp(4),
                     0,
                     0
                 )
 
                 maxLines =
-                    1
+                    2
             }
 
         val status =
@@ -290,13 +310,22 @@ class OverlayController(
             ).apply {
 
                 textSize =
-                    9.5f
+                    8.5f
 
                 setTextColor(
                     Color.parseColor(
-                        "#B8FFFFFF"
+                        "#AFFFFFFF"
                     )
                 )
+
+                maxWidth =
+                    dp(175)
+
+                maxLines =
+                    1
+
+                ellipsize =
+                    TextUtils.TruncateAt.END
 
                 setPadding(
                     0,
@@ -304,23 +333,10 @@ class OverlayController(
                     0,
                     0
                 )
-
-                maxWidth =
-                    dp(235)
-
-                maxLines =
-                    2
-
-                ellipsize =
-                    TextUtils.TruncateAt.END
             }
 
         container.addView(
-            title
-        )
-
-        container.addView(
-            competition
+            league
         )
 
         container.addView(
@@ -334,6 +350,16 @@ class OverlayController(
         container.addView(
             status
         )
+
+        val landscape =
+            service
+                .resources
+                .displayMetrics
+                .widthPixels >
+                service
+                    .resources
+                    .displayMetrics
+                    .heightPixels
 
         val params =
             WindowManager.LayoutParams(
@@ -351,21 +377,40 @@ class OverlayController(
                 PixelFormat.TRANSLUCENT
             ).apply {
 
-                /*
-                 * Antes estaba CENTER_HORIZONTAL.
-                 *
-                 * Ahora se coloca en la esquina superior derecha
-                 * y evita tapar el nombre/estado central del jugador.
-                 */
-                gravity =
-                    Gravity.TOP or
-                        Gravity.END
+                if (
+                    landscape
+                ) {
 
-                x =
-                    dp(10)
+                    /*
+                     * En tu captura:
+                     * espacio libre inferior derecho.
+                     */
+                    gravity =
+                        Gravity.BOTTOM or
+                            Gravity.END
 
-                y =
-                    dp(105)
+                    x =
+                        dp(12)
+
+                    y =
+                        dp(18)
+
+                } else {
+
+                    /*
+                     * En vertical evitamos la zona inferior
+                     * de botones/navegación.
+                     */
+                    gravity =
+                        Gravity.TOP or
+                            Gravity.END
+
+                    x =
+                        dp(8)
+
+                    y =
+                        dp(150)
+                }
             }
 
         windowManager.addView(
@@ -376,11 +421,8 @@ class OverlayController(
         card =
             container
 
-        titleView =
-            title
-
-        competitionView =
-            competition
+        leagueView =
+            league
 
         nameView =
             name
