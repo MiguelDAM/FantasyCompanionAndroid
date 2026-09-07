@@ -148,7 +148,10 @@ class LaLigaStatsRepository {
                     val key = normalizeStatKey(
                         s.optString("name", s.optString("stat", s.optString("key", "")))
                     )
-                    val raw = s.opt("value") ?: s.opt("total") ?: s.opt("stat_value")
+                    val raw = s.opt("stat")
+    ?: s.opt("value")
+    ?: s.opt("total")
+    ?: s.opt("stat_value")
                     val n = when (raw) {
                         is Number -> raw.toInt()
                         is String -> raw.toDoubleOrNull()?.toInt()
@@ -184,7 +187,14 @@ class LaLigaStatsRepository {
             goals = get("goals", "goal"),
             assists = get("goal_assists", "assists", "assist"),
             yellowCards = get("yellow_cards", "yellowcards"),
-            redCards = get("red_cards", "redcards", "second_yellow_red_card"),
+            redCards = get(
+    "red_cards",
+    "redcards",
+    "total_red_cards",
+    "straight_red_cards",
+    "red_cards_2nd_yellow",
+    "second_yellow_red_card"
+),
             cleanSheets = get("clean_sheets", "cleansheets"),
             source = "LALIGA"
         )
