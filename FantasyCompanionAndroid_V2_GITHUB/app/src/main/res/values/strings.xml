@@ -1,4 +1,0 @@
-<resources>
-    <string name="app_name">Fantasy Companion</string>
-    <string name="accessibility_description">Detecta la ficha visible de un jugador en LALIGA Fantasy para mostrar estadísticas en una tarjeta superpuesta. No realiza pulsaciones ni modifica la aplicación.</string>
-</resources>
