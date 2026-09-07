@@ -6,7 +6,8 @@ import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 
-class FantasyAccessibilityService : AccessibilityService() {
+class FantasyAccessibilityService :
+    AccessibilityService() {
 
     companion object {
 
@@ -31,19 +32,29 @@ class FantasyAccessibilityService : AccessibilityService() {
     private var lastDumpAt =
         0L
 
-    /*
-     * Ya no guardamos solo "currentPlayer".
-     *
-     * Guardamos una firma de los candidatos visibles,
-     * porque todavía no sabemos cuál de ellos es el jugador.
-     */
     private var currentDetectionKey:
         String? = null
 
+    /*
+     * También comprobamos periódicamente si seguimos
+     * en una ficha aunque no llegue un evento de accesibilidad.
+     */
     private val activeWindowCheck =
         object : Runnable {
 
             override fun run() {
+
+                if (
+                    !::overlay.isInitialized
+                ) {
+
+                    mainHandler.postDelayed(
+                        this,
+                        500
+                    )
+
+                    return
+                }
 
                 val root =
                     rootInActiveWindow
@@ -58,20 +69,30 @@ class FantasyAccessibilityService : AccessibilityService() {
                     TARGET_PACKAGE
                 ) {
 
-                    currentDetectionKey =
-                        null
+                    closePlayerOverlay()
 
+                } else {
+
+                    val detection =
+                        PlayerDetector.detect(
+                            root
+                        )
+
+                    /*
+                     * Seguimos dentro de LALIGA Fantasy,
+                     * pero hemos salido de la ficha.
+                     */
                     if (
-                        ::overlay.isInitialized
+                        !detection.isPlayerProfile
                     ) {
 
-                        overlay.hide()
+                        closePlayerOverlay()
                     }
                 }
 
                 mainHandler.postDelayed(
                     this,
-                    700
+                    500
                 )
             }
         }
@@ -91,7 +112,7 @@ class FantasyAccessibilityService : AccessibilityService() {
 
         Log.i(
             TAG,
-            "Fantasy Companion V2 conectado"
+            "Fantasy Companion conectado"
         )
     }
 
@@ -111,6 +132,9 @@ class FantasyAccessibilityService : AccessibilityService() {
                 ?.toString() !=
             TARGET_PACKAGE
         ) {
+
+            closePlayerOverlay()
+
             return
         }
 
@@ -123,6 +147,21 @@ class FantasyAccessibilityService : AccessibilityService() {
                 root
             )
 
+        /*
+         * CLAVE:
+         *
+         * no enseñamos absolutamente nada
+         * si no estamos en una ficha.
+         */
+        if (
+            !detection.isPlayerProfile
+        ) {
+
+            closePlayerOverlay()
+
+            return
+        }
+
         val now =
             System.currentTimeMillis()
 
@@ -133,6 +172,11 @@ class FantasyAccessibilityService : AccessibilityService() {
 
             lastDumpAt =
                 now
+
+            Log.d(
+                TAG,
+                "FICHA DETECTADA"
+            )
 
             Log.d(
                 TAG,
@@ -155,39 +199,26 @@ class FantasyAccessibilityService : AccessibilityService() {
         }
 
         /*
-         * Antes:
+         * Ya no exigimos score >= 5.
          *
-         * val playerName = detection.playerName
-         *
-         * Eso era el problema:
-         * si el detector escogía FC Barcelona,
-         * buscábamos FC Barcelona como jugador.
-         *
-         *
-         * AHORA:
-         *
-         * enviamos varios candidatos al repository.
+         * La API de LALIGA es nuestro segundo filtro:
+         * un texto puede llegar aquí con score bajo y aun así
+         * ser exactamente "Mbappé" o "Camara".
          */
         val candidates =
             detection
                 .candidates
-                .filter {
-                    it.score >= 5
-                }
                 .map {
                     it.value
                 }
                 .distinct()
-                .take(8)
+                .take(24)
 
         if (
             candidates.isEmpty()
         ) {
 
-            currentDetectionKey =
-                null
-
-            overlay.hide()
+            closePlayerOverlay()
 
             return
         }
@@ -198,10 +229,6 @@ class FantasyAccessibilityService : AccessibilityService() {
                     separator = "||"
                 )
 
-        /*
-         * Evitar relanzar la misma consulta en cada evento
-         * de accesibilidad.
-         */
         if (
             detectionKey ==
             currentDetectionKey
@@ -214,7 +241,7 @@ class FantasyAccessibilityService : AccessibilityService() {
 
         Log.d(
             TAG,
-            "ENVIANDO CANDIDATOS API: " +
+            "ENVIANDO A API: " +
                 candidates.joinToString(" | ")
         )
 
@@ -223,10 +250,6 @@ class FantasyAccessibilityService : AccessibilityService() {
                 candidates
         ) { stats ->
 
-            /*
-             * Solo mostramos la respuesta si seguimos
-             * viendo la misma ficha.
-             */
             if (
                 currentDetectionKey ==
                 detectionKey &&
@@ -240,7 +263,7 @@ class FantasyAccessibilityService : AccessibilityService() {
         }
     }
 
-    override fun onInterrupt() {
+    private fun closePlayerOverlay() {
 
         currentDetectionKey =
             null
@@ -253,21 +276,18 @@ class FantasyAccessibilityService : AccessibilityService() {
         }
     }
 
+    override fun onInterrupt() {
+
+        closePlayerOverlay()
+    }
+
     override fun onDestroy() {
 
         mainHandler.removeCallbacks(
             activeWindowCheck
         )
 
-        currentDetectionKey =
-            null
-
-        if (
-            ::overlay.isInitialized
-        ) {
-
-            overlay.hide()
-        }
+        closePlayerOverlay()
 
         super.onDestroy()
     }
