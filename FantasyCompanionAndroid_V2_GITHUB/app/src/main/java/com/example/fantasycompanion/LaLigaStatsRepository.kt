@@ -11,13 +11,15 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.text.Normalizer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.concurrent.thread
 
 class LaLigaStatsRepository {
 
     companion object {
 
-        private const val TAG = "FantasyAPI"
+        private const val TAG =
+            "FantasyAPI"
 
         private const val BASE_URL =
             "https://apim.laliga.com/public-service"
@@ -25,39 +27,112 @@ class LaLigaStatsRepository {
         private const val API_KEY =
             "c13c3a8e2f6b46da9c5c425cf61fab3e"
 
-        private const val PAGE_SIZE = 100
+        private const val PAGE_SIZE =
+            100
 
-        private const val CONNECT_TIMEOUT = 7000
-        private const val READ_TIMEOUT = 12000
+        private const val CONNECT_TIMEOUT =
+            7000
 
-        private val SUBSCRIPTIONS = listOf(
-            "laliga-easports-2026",
-            "laliga-hypermotion-2026"
+        private const val READ_TIMEOUT =
+            12000
+
+        private data class CompetitionConfig(
+
+            val slug: String,
+
+            val label: String
         )
+
+        /*
+         * Sistema escalable.
+         *
+         * Para añadir otra competición en el futuro,
+         * basta con añadir otra configuración aquí.
+         */
+        private val COMPETITIONS =
+            listOf(
+
+                CompetitionConfig(
+                    slug =
+                        "laliga-easports-2026",
+
+                    label =
+                        "LALIGA EA SPORTS"
+                ),
+
+                CompetitionConfig(
+                    slug =
+                        "laliga-hypermotion-2026",
+
+                    label =
+                        "LALIGA HYPERMOTION"
+                )
+            )
     }
 
+    private data class IndexedPlayer(
+
+        val player: JSONObject,
+
+        val competition:
+            CompetitionConfig
+    )
+
+    private data class PlayerMatch(
+
+        val uiCandidate: String,
+
+        val apiAlias: String,
+
+        val entry: IndexedPlayer,
+
+        val score: Int
+    )
+
+    private data class Diagnostic(
+
+        val alias: String,
+
+        val score: Int
+    )
+
     private val main =
-        Handler(Looper.getMainLooper())
+        Handler(
+            Looper.getMainLooper()
+        )
 
     /*
-     * alias normalizado -> jugador LALIGA
+     * Un alias puede existir en más de una competición.
+     *
+     * Por eso ahora no usamos:
+     *
+     * alias -> jugador
+     *
+     * sino:
+     *
+     * alias -> lista de posibles jugadores.
      */
     private val playerIndex =
-        ConcurrentHashMap<String, JSONObject>()
+        ConcurrentHashMap<
+            String,
+            CopyOnWriteArrayList<IndexedPlayer>
+        >()
 
-    /*
-     * Nombre real del jugador -> resultado final.
-     */
     private val statsCache =
-        ConcurrentHashMap<String, PlayerStats>()
+        ConcurrentHashMap<
+            String,
+            PlayerStats
+        >()
 
     private val loadedSubscriptions =
-        ConcurrentHashMap.newKeySet<String>()
+        ConcurrentHashMap
+            .newKeySet<String>()
 
-    private val loadLock = Any()
+    private val loadLock =
+        Any()
 
     // ============================================================
-    // COMPATIBILIDAD
+    // API
     // ============================================================
 
     fun get(
@@ -66,24 +141,13 @@ class LaLigaStatsRepository {
     ) {
 
         get(
-            candidateNames = listOf(playerName),
-            callback = callback
+            candidateNames =
+                listOf(playerName),
+
+            callback =
+                callback
         )
     }
-
-    // ============================================================
-    // NUEVO MÉTODO
-    //
-    // Recibe VARIOS textos que podrían ser el jugador.
-    //
-    // Ejemplo:
-    //
-    // FC Barcelona
-    // Lamine Yamal
-    // Delantero
-    //
-    // El índice de LALIGA determinará cuál es realmente un jugador.
-    // ============================================================
 
     fun get(
         candidateNames: List<String>,
@@ -92,61 +156,80 @@ class LaLigaStatsRepository {
 
         val candidates =
             candidateNames
-                .map { it.trim() }
-                .filter { it.length >= 3 }
-                .distinctBy { normalize(it) }
+                .map {
+                    it.trim()
+                }
+                .filter {
+                    it.length >= 3
+                }
+                .distinctBy {
+                    normalize(it)
+                }
                 .take(8)
 
-        if (candidates.isEmpty()) {
+        if (
+            candidates.isEmpty()
+        ) {
 
             callback(
+
                 PlayerStats(
-                    playerName = "Jugador",
-                    error = "No se detectó ningún candidato"
+                    playerName =
+                        "Jugador",
+
+                    error =
+                        "No se detectó ningún candidato"
                 )
             )
 
             return
         }
 
-        /*
-         * IMPORTANTE:
-         *
-         * Ya no mostramos el primer candidato como jugador mientras
-         * cargamos, porque puede ser precisamente el equipo.
-         */
         callback(
+
             PlayerStats(
-                playerName = "Identificando jugador…",
-                loading = true
+                playerName =
+                    "Identificando jugador…",
+
+                loading =
+                    true
             )
         )
 
         thread(
-            name = "laliga-stats",
-            isDaemon = true
+            name =
+                "laliga-stats",
+
+            isDaemon =
+                true
         ) {
 
-            val result = try {
+            val result =
+                try {
 
-                findStatsForCandidates(
-                    candidates
-                )
+                    findStatsForCandidates(
+                        candidates
+                    )
 
-            } catch (e: Exception) {
+                } catch (
+                    e: Exception
+                ) {
 
-                Log.e(
-                    TAG,
-                    "Error consultando candidatos $candidates",
-                    e
-                )
+                    Log.e(
+                        TAG,
+                        "Error buscando $candidates",
+                        e
+                    )
 
-                PlayerStats(
-                    playerName = candidates.first(),
-                    error = e.message
-                        ?: "Error consultando LALIGA"
-                )
-            }
+                    PlayerStats(
+                        playerName =
+                            candidates.first(),
+
+                        error =
+                            e.message
+                                ?: "Error consultando LALIGA"
+                    )
+                }
 
             main.post {
 
@@ -158,7 +241,7 @@ class LaLigaStatsRepository {
     }
 
     // ============================================================
-    // FLUJO PRINCIPAL
+    // MOTOR MULTI-COMPETICIÓN
     // ============================================================
 
     private fun findStatsForCandidates(
@@ -167,77 +250,94 @@ class LaLigaStatsRepository {
 
         Log.d(
             TAG,
-            "========================================="
+            "======================================"
         )
 
         Log.d(
             TAG,
-            "CANDIDATOS UI: ${candidates.joinToString(" | ")}"
+            "CANDIDATOS: ${candidates.joinToString(" | ")}"
         )
 
         /*
-         * 1. Primero intentamos resolverlos con lo que ya tenemos
-         * descargado.
+         * Si ya tenemos un match muy fuerte en caché,
+         * no hacemos red.
          */
         findBestAcrossCandidates(
             candidates
-        )?.let { match ->
-
-            return resultForMatch(
-                match
-            )
-        }
-
-        synchronized(loadLock) {
-
-            /*
-             * Otro hilo podría haber cargado jugadores.
-             */
-            findBestAcrossCandidates(
-                candidates
-            )?.let { match ->
+        )
+            ?.takeIf {
+                it.score >= 90
+            }
+            ?.let {
 
                 return resultForMatch(
-                    match
+                    it
                 )
             }
 
-            var successfulRequests = 0
-            var lastError: String? = null
+        synchronized(
+            loadLock
+        ) {
+
+            findBestAcrossCandidates(
+                candidates
+            )
+                ?.takeIf {
+                    it.score >= 90
+                }
+                ?.let {
+
+                    return resultForMatch(
+                        it
+                    )
+                }
+
+            var successfulLoads =
+                0
+
+            var lastError:
+                String? = null
 
             /*
-             * Primera y Segunda División.
+             * Vamos cargando competiciones.
+             *
+             * Si aparece un match exacto (100),
+             * podemos devolver inmediatamente.
              */
             for (
-                subscription in SUBSCRIPTIONS
+                competition
+                in COMPETITIONS
             ) {
 
                 if (
-                    !loadedSubscriptions.contains(
-                        subscription
-                    )
+                    !loadedSubscriptions
+                        .contains(
+                            competition.slug
+                        )
                 ) {
 
                     try {
 
-                        loadSubscription(
-                            subscription
+                        loadCompetition(
+                            competition
                         )
 
                         loadedSubscriptions.add(
-                            subscription
+                            competition.slug
                         )
 
-                        successfulRequests++
+                        successfulLoads++
 
-                    } catch (e: Exception) {
+                    } catch (
+                        e: Exception
+                    ) {
 
                         lastError =
                             e.message
 
                         Log.e(
                             TAG,
-                            "Error cargando $subscription",
+                            "Error cargando ${competition.label}",
                             e
                         )
 
@@ -245,176 +345,92 @@ class LaLigaStatsRepository {
                     }
                 }
 
-                /*
-                 * Buscar tras cargar cada competición.
-                 */
-                findBestAcrossCandidates(
-                    candidates
-                )?.let { match ->
+                val currentBest =
+                    findBestAcrossCandidates(
+                        candidates
+                    )
+
+                if (
+                    currentBest != null &&
+                    currentBest.score >= 100
+                ) {
 
                     return resultForMatch(
-                        match
+                        currentBest
                     )
                 }
             }
 
             /*
-             * Diagnóstico visible.
+             * Con Primera + Segunda disponibles,
+             * elegimos el mejor global.
              */
+            findBestAcrossCandidates(
+                candidates
+            )
+                ?.takeIf {
+                    it.score >= 75
+                }
+                ?.let {
+
+                    return resultForMatch(
+                        it
+                    )
+                }
+
             val diagnostic =
                 bestDiagnostic(
                     candidates
                 )
 
             if (
-                successfulRequests == 0 &&
-                playerIndex.isEmpty()
+                successfulLoads == 0 &&
+                playerCount() == 0
             ) {
 
                 return PlayerStats(
-                    playerName = candidates.first(),
-                    error = buildString {
 
-                        append(
-                            lastError
-                                ?: "No se pudieron cargar jugadores de LALIGA"
-                        )
+                    playerName =
+                        candidates.first(),
 
-                        append("\nCandidatos: ")
-
-                        append(
-                            candidates.joinToString(" | ")
-                        )
-
-                        append(
-                            "\nÍndice API: ${playerIndex.size}"
-                        )
-                    }
+                    error =
+                        lastError
+                            ?: "No se pudieron cargar LALIGA EA SPORTS ni HYPERMOTION"
                 )
             }
 
             return PlayerStats(
-                playerName = candidates.first(),
-                error = buildString {
 
-                    append("Jugador no encontrado")
+                playerName =
+                    candidates.first(),
 
-                    append(
-                        "\nCandidatos: ${candidates.joinToString(" | ")}"
-                    )
-
-                    append(
-                        "\nMejor API: ${diagnostic.alias.ifBlank { "—" }}"
-                    )
-
-                    append(
-                        "\nScore: ${diagnostic.score}"
-                    )
-
-                    append(
-                        "\nÍndice API: ${playerIndex.size}"
-                    )
-                }
+                error =
+                    "Jugador no encontrado · " +
+                        "mejor API: " +
+                        diagnostic.alias.ifBlank {
+                            "—"
+                        } +
+                        " (${diagnostic.score})"
             )
         }
     }
 
     // ============================================================
-    // RESULTADO DEL MATCH
+    // CARGAR COMPETICIÓN
     // ============================================================
 
-    private fun resultForMatch(
-        match: PlayerMatch
-    ): PlayerStats {
-
-        val player =
-            match.player
-
-        val realName =
-            playerDisplayName(
-                player
-            )
-
-        val cacheKey =
-            normalize(
-                realName
-            )
-
-        statsCache[
-            cacheKey
-        ]?.let {
-
-            return it
-        }
-
-        Log.d(
-            TAG,
-            "MATCH DEFINITIVO"
-        )
-
-        Log.d(
-            TAG,
-            "UI='${match.uiCandidate}'"
-        )
-
-        Log.d(
-            TAG,
-            "API='${match.apiAlias}'"
-        )
-
-        Log.d(
-            TAG,
-            "SCORE=${match.score}"
-        )
-
-        Log.d(
-            TAG,
-            "TEAM=${teamName(player)}"
-        )
-
-        Log.d(
-            TAG,
-            "SLUG=${player.optString("slug")}"
-        )
-
-        /*
-         * Primero intentamos endpoint individual.
-         *
-         * Si falla, usamos stats[] que ya venían en el listado.
-         */
-        val result =
-            fetchIndividualStats(
-                player
-            ) ?: parsePlayerStats(
-                player
-            )
-
-        if (
-            result.error == null
-        ) {
-
-            statsCache[
-                normalize(result.playerName)
-            ] = result
-        }
-
-        return result
-    }
-
-    // ============================================================
-    // CARGA DE UNA COMPETICIÓN
-    // ============================================================
-
-    private fun loadSubscription(
-        subscription: String
+    private fun loadCompetition(
+        competition:
+            CompetitionConfig
     ) {
 
         Log.d(
             TAG,
-            "CARGANDO $subscription"
+            "CARGANDO ${competition.label}"
         )
 
-        var offset = 0
+        var offset =
+            0
 
         while (
             offset < 1500
@@ -422,7 +438,7 @@ class LaLigaStatsRepository {
 
             val url =
                 "$BASE_URL/api/v1/" +
-                    "subscriptions/$subscription/" +
+                    "subscriptions/${competition.slug}/" +
                     "players/stats" +
                     "?limit=$PAGE_SIZE" +
                     "&offset=$offset"
@@ -436,16 +452,9 @@ class LaLigaStatsRepository {
                 root.optJSONArray(
                     "player_stats"
                 )
-
-            if (
-                players == null
-            ) {
-
-                throw IllegalStateException(
-                    "Respuesta sin player_stats " +
-                        "(keys=${jsonKeys(root)})"
-                )
-            }
+                    ?: throw IllegalStateException(
+                        "${competition.label}: respuesta sin player_stats"
+                    )
 
             val total =
                 root.optInt(
@@ -455,7 +464,7 @@ class LaLigaStatsRepository {
 
             Log.d(
                 TAG,
-                "$subscription " +
+                "${competition.label}: " +
                     "offset=$offset " +
                     "recibidos=${players.length()} " +
                     "total=$total"
@@ -468,14 +477,13 @@ class LaLigaStatsRepository {
             }
 
             indexPlayers(
-                players
+                players,
+                competition
             )
 
-            /*
-             * Fin normal de paginación.
-             */
             if (
-                players.length() < PAGE_SIZE
+                players.length() <
+                PAGE_SIZE
             ) {
                 break
             }
@@ -486,25 +494,39 @@ class LaLigaStatsRepository {
 
         Log.d(
             TAG,
-            "ÍNDICE ACTUAL=${playerIndex.size}"
+            "${competition.label} cargada. " +
+                "Jugadores indexados=${playerCount()}"
         )
     }
 
     // ============================================================
-    // INDEXAR JUGADORES
+    // INDEX
     // ============================================================
 
     private fun indexPlayers(
-        players: JSONArray
+        players: JSONArray,
+        competition:
+            CompetitionConfig
     ) {
 
         for (
-            i in 0 until players.length()
+            i in
+            0 until players.length()
         ) {
 
             val player =
-                players.optJSONObject(i)
+                players
+                    .optJSONObject(i)
                     ?: continue
+
+            val entry =
+                IndexedPlayer(
+                    player =
+                        player,
+
+                    competition =
+                        competition
+                )
 
             val aliases =
                 linkedSetOf<String>()
@@ -549,13 +571,6 @@ class LaLigaStatsRepository {
                 )
             )
 
-            /*
-             * El slug puede ayudar:
-             *
-             * lamine-yamal
-             *      ↓
-             * lamine yamal
-             */
             val slug =
                 player
                     .optString(
@@ -577,28 +592,65 @@ class LaLigaStatsRepository {
                 )
             }
 
-            aliases.forEach { alias ->
+            aliases.forEach {
+                alias ->
 
-                val normalized =
-                    normalize(
-                        alias
-                    )
-
-                if (
-                    normalized.length >= 3
-                ) {
-
-                    playerIndex.putIfAbsent(
-                        normalized,
-                        player
-                    )
-                }
+                addIndexedAlias(
+                    alias,
+                    entry
+                )
             }
         }
     }
 
+    private fun addIndexedAlias(
+        alias: String,
+        entry: IndexedPlayer
+    ) {
+
+        val normalized =
+            normalize(
+                alias
+            )
+
+        if (
+            normalized.length < 3
+        ) {
+            return
+        }
+
+        val bucket =
+            playerIndex
+                .computeIfAbsent(
+                    normalized
+                ) {
+
+                    CopyOnWriteArrayList()
+                }
+
+        val identity =
+            playerIdentity(
+                entry
+            )
+
+        if (
+            bucket.none {
+
+                playerIdentity(it) ==
+                    identity
+
+            }
+        ) {
+
+            bucket.add(
+                entry
+            )
+        }
+    }
+
     private fun addAlias(
-        aliases: MutableSet<String>,
+        aliases:
+            MutableSet<String>,
         value: String
     ) {
 
@@ -619,26 +671,8 @@ class LaLigaStatsRepository {
     }
 
     // ============================================================
-    // BUSCAR ENTRE TODOS LOS CANDIDATOS
+    // MATCH
     // ============================================================
-
-    private data class PlayerMatch(
-
-        val uiCandidate: String,
-
-        val apiAlias: String,
-
-        val player: JSONObject,
-
-        val score: Int
-    )
-
-    private data class Diagnostic(
-
-        val alias: String,
-
-        val score: Int
-    )
 
     private fun findBestAcrossCandidates(
         candidates: List<String>
@@ -657,45 +691,19 @@ class LaLigaStatsRepository {
                 )
 
             /*
-             * MATCH EXACTO.
+             * Exactos.
              */
             playerIndex[
                 requested
-            ]?.let { player ->
-
-                Log.d(
-                    TAG,
-                    "MATCH EXACTO: '$uiCandidate'"
-                )
-
-                return PlayerMatch(
-                    uiCandidate =
-                        uiCandidate,
-
-                    apiAlias =
-                        requested,
-
-                    player =
-                        player,
-
-                    score =
-                        100
-                )
-            }
-
-            /*
-             * MATCH APROXIMADO.
-             */
-            for (
-                (apiAlias, player)
-                in playerIndex
-            ) {
+            ]?.forEach {
+                entry ->
 
                 val score =
-                    scoreName(
-                        requested,
-                        apiAlias
-                    )
+                    100 +
+                        contextBonus(
+                            entry,
+                            candidates
+                        )
 
                 if (
                     score >
@@ -708,92 +716,141 @@ class LaLigaStatsRepository {
                                 uiCandidate,
 
                             apiAlias =
-                                apiAlias,
+                                requested,
 
-                            player =
-                                player,
+                            entry =
+                                entry,
 
                             score =
                                 score
                         )
                 }
             }
-        }
 
-        if (
-            best != null
-        ) {
-
-            Log.d(
-                TAG,
-                "BEST GLOBAL: " +
-                    "UI='${best.uiCandidate}' " +
-                    "API='${best.apiAlias}' " +
-                    "score=${best.score}"
-            )
-        }
-
-        /*
-         * Seguimos siendo conservadores para no volver
-         * al problema Barça/Espanyol.
-         */
-        return best
-            ?.takeIf {
-                it.score >= 75
-            }
-    }
-
-    private fun bestDiagnostic(
-        candidates: List<String>
-    ): Diagnostic {
-
-        var bestAlias = ""
-        var bestScore = 0
-
-        for (
-            candidate in candidates
-        ) {
-
-            val requested =
-                normalize(
-                    candidate
-                )
-
+            /*
+             * Aproximados.
+             */
             for (
-                apiAlias in playerIndex.keys
+                (apiAlias, entries)
+                in playerIndex
             ) {
 
-                val score =
+                val baseScore =
                     scoreName(
                         requested,
                         apiAlias
                     )
 
                 if (
-                    score > bestScore
+                    baseScore == 0
                 ) {
+                    continue
+                }
 
-                    bestScore =
-                        score
+                entries.forEach {
+                    entry ->
 
-                    bestAlias =
-                        apiAlias
+                    val score =
+                        baseScore +
+                            contextBonus(
+                                entry,
+                                candidates
+                            )
+
+                    if (
+                        score >
+                        (best?.score ?: 0)
+                    ) {
+
+                        best =
+                            PlayerMatch(
+                                uiCandidate =
+                                    uiCandidate,
+
+                                apiAlias =
+                                    apiAlias,
+
+                                entry =
+                                    entry,
+
+                                score =
+                                    score
+                            )
+                    }
                 }
             }
         }
 
-        return Diagnostic(
-            alias =
-                bestAlias,
+        best?.let {
 
-            score =
-                bestScore
-        )
+            Log.d(
+                TAG,
+                "BEST: " +
+                    "UI='${it.uiCandidate}' " +
+                    "API='${it.apiAlias}' " +
+                    "score=${it.score} " +
+                    "competition=${it.entry.competition.label} " +
+                    "team=${teamName(it.entry.player)}"
+            )
+        }
+
+        return best
     }
 
-    // ============================================================
-    // COMPARAR NOMBRES
-    // ============================================================
+    /*
+     * Aprovechamos algo que Fantasy ya nos da:
+     * normalmente el equipo también está visible.
+     *
+     * Eso ayuda a desempatar jugadores con nombres parecidos
+     * entre Primera y Segunda.
+     */
+    private fun contextBonus(
+        entry: IndexedPlayer,
+        candidates: List<String>
+    ): Int {
+
+        val team =
+            normalize(
+                teamName(
+                    entry.player
+                )
+            )
+
+        if (
+            team.isBlank()
+        ) {
+            return 0
+        }
+
+        for (
+            candidate in candidates
+        ) {
+
+            val value =
+                normalize(
+                    candidate
+                )
+
+            if (
+                value == team
+            ) {
+                return 12
+            }
+
+            if (
+                value.length >= 4 &&
+                team.length >= 4 &&
+                (
+                    value.contains(team) ||
+                        team.contains(value)
+                    )
+            ) {
+                return 8
+            }
+        }
+
+        return 0
+    }
 
     private fun scoreName(
         requested: String,
@@ -807,19 +864,13 @@ class LaLigaStatsRepository {
             return 0
         }
 
-        /*
-         * Pedri == Pedri
-         */
         if (
-            requested == candidate
+            requested ==
+            candidate
         ) {
             return 100
         }
 
-        /*
-         * Lewandowski
-         * Robert Lewandowski
-         */
         if (
             requested.length >= 4 &&
             candidate.length >= 4 &&
@@ -827,12 +878,11 @@ class LaLigaStatsRepository {
                 requested.contains(
                     candidate
                 ) ||
-                candidate.contains(
-                    requested
+                    candidate.contains(
+                        requested
+                    )
                 )
-            )
         ) {
-
             return 90
         }
 
@@ -864,35 +914,133 @@ class LaLigaStatsRepository {
                 b
             )
 
-        /*
-         * Lamine Yamal
-         * Lamine Yamal Nasraoui Ebana
-         */
         if (
             common.size >= 2
         ) {
             return 82
         }
 
-        /*
-         * Nombre único:
-         *
-         * Pedri
-         * Gavi
-         * Raphinha
-         */
         if (
             common.size == 1 &&
             (
                 a.size == 1 ||
-                b.size == 1
-            )
+                    b.size == 1
+                )
         ) {
-
             return 75
         }
 
         return 0
+    }
+
+    private fun bestDiagnostic(
+        candidates: List<String>
+    ): Diagnostic {
+
+        var bestAlias =
+            ""
+
+        var bestScore =
+            0
+
+        for (
+            candidate in candidates
+        ) {
+
+            val requested =
+                normalize(
+                    candidate
+                )
+
+            for (
+                alias in playerIndex.keys
+            ) {
+
+                val score =
+                    scoreName(
+                        requested,
+                        alias
+                    )
+
+                if (
+                    score > bestScore
+                ) {
+
+                    bestScore =
+                        score
+
+                    bestAlias =
+                        alias
+                }
+            }
+        }
+
+        return Diagnostic(
+            alias =
+                bestAlias,
+
+            score =
+                bestScore
+        )
+    }
+
+    // ============================================================
+    // RESULTADO
+    // ============================================================
+
+    private fun resultForMatch(
+        match: PlayerMatch
+    ): PlayerStats {
+
+        val entry =
+            match.entry
+
+        val player =
+            entry.player
+
+        val cacheKey =
+            entry.competition.slug +
+                ":" +
+                normalize(
+                    playerDisplayName(
+                        player
+                    )
+                )
+
+        statsCache[
+            cacheKey
+        ]?.let {
+
+            return it
+        }
+
+        Log.d(
+            TAG,
+            "MATCH DEFINITIVO: " +
+                "${playerDisplayName(player)} " +
+                "| ${entry.competition.label} " +
+                "| ${teamName(player)}"
+        )
+
+        val result =
+            fetchIndividualStats(
+                entry
+            )
+                ?: parsePlayerStats(
+                    entry
+                )
+
+        if (
+            result.error == null
+        ) {
+
+            statsCache[
+                cacheKey
+            ] =
+                result
+        }
+
+        return result
     }
 
     // ============================================================
@@ -900,8 +1048,11 @@ class LaLigaStatsRepository {
     // ============================================================
 
     private fun fetchIndividualStats(
-        indexedPlayer: JSONObject
+        entry: IndexedPlayer
     ): PlayerStats? {
+
+        val indexedPlayer =
+            entry.player
 
         val slug =
             indexedPlayer
@@ -914,18 +1065,12 @@ class LaLigaStatsRepository {
         if (
             slug.isBlank()
         ) {
-
             return null
         }
 
         val url =
             "$BASE_URL/api/v1/" +
                 "players/$slug/stats"
-
-        Log.d(
-            TAG,
-            "GET INDIVIDUAL $url"
-        )
 
         return try {
 
@@ -940,8 +1085,35 @@ class LaLigaStatsRepository {
                 )
                     ?: return null
 
+            /*
+             * Protección extra:
+             * el endpoint individual debe representar
+             * el mismo jugador que el indexado.
+             */
+            if (
+                !samePlayer(
+                    indexedPlayer,
+                    player
+                )
+            ) {
+
+                Log.w(
+                    TAG,
+                    "Endpoint individual devolvió otro jugador. Usando listado."
+                )
+
+                return null
+            }
+
             parsePlayerStats(
-                player
+
+                IndexedPlayer(
+                    player =
+                        player,
+
+                    competition =
+                        entry.competition
+                )
             )
 
         } catch (
@@ -950,7 +1122,7 @@ class LaLigaStatsRepository {
 
             Log.w(
                 TAG,
-                "Endpoint individual falló: ${e.message}"
+                "Individual falló: ${e.message}"
             )
 
             null
@@ -958,44 +1130,62 @@ class LaLigaStatsRepository {
     }
 
     // ============================================================
-    // PARSEO DE ESTADÍSTICAS
+    // PARSEO
     // ============================================================
 
     private fun parsePlayerStats(
-        player: JSONObject
+        entry: IndexedPlayer
     ): PlayerStats {
 
-        val stats =
-            mutableMapOf<String, Int>()
+        val player =
+            entry.player
 
-        val array =
+        val map =
+            mutableMapOf<
+                String,
+                Int
+            >()
+
+        val stats =
             player.optJSONArray(
                 "stats"
             )
 
         if (
-            array == null
+            stats == null
         ) {
 
             return PlayerStats(
+
                 playerName =
                     playerDisplayName(
                         player
                     ),
+
+                teamName =
+                    teamName(
+                        player
+                    ),
+
+                competition =
+                    entry.competition.label,
+
                 error =
-                    "Jugador encontrado pero sin stats[]"
+                    "Jugador encontrado pero sin estadísticas"
             )
         }
 
         for (
-            i in 0 until array.length()
+            i in
+            0 until stats.length()
         ) {
 
             val item =
-                array.optJSONObject(i)
+                stats
+                    .optJSONObject(i)
                     ?: continue
 
-            val statName =
+            val name =
                 item
                     .optString(
                         "name",
@@ -1004,7 +1194,7 @@ class LaLigaStatsRepository {
                     .trim()
 
             if (
-                statName.isBlank()
+                name.isBlank()
             ) {
                 continue
             }
@@ -1040,11 +1230,12 @@ class LaLigaStatsRepository {
                 value != null
             ) {
 
-                stats[
+                map[
                     normalizeStatKey(
-                        statName
+                        name
                     )
-                ] = value
+                ] =
+                    value
             }
         }
 
@@ -1052,11 +1243,10 @@ class LaLigaStatsRepository {
             vararg names: String
         ): Int? {
 
-            for (
-                name in names
-            ) {
+            names.forEach {
+                name ->
 
-                stats[
+                map[
                     normalizeStatKey(
                         name
                     )
@@ -1101,58 +1291,50 @@ class LaLigaStatsRepository {
                     null
                 }
 
-        val result =
-            PlayerStats(
+        return PlayerStats(
 
-                playerName =
-                    playerDisplayName(
-                        player
-                    ),
+            playerName =
+                playerDisplayName(
+                    player
+                ),
 
-                goals =
-                    stat(
-                        "goals"
-                    ),
+            goals =
+                stat(
+                    "goals"
+                ),
 
-                assists =
-                    stat(
-                        "goal_assists",
-                        "assists"
-                    ),
+            assists =
+                stat(
+                    "goal_assists",
+                    "assists"
+                ),
 
-                yellowCards =
-                    stat(
-                        "yellow_cards"
-                    ),
+            yellowCards =
+                stat(
+                    "yellow_cards"
+                ),
 
-                redCards =
-                    redCards,
+            redCards =
+                redCards,
 
-                cleanSheets =
-                    stat(
-                        "clean_sheets"
-                    ),
+            cleanSheets =
+                stat(
+                    "clean_sheets"
+                ),
 
-                source =
-                    "LALIGA"
-            )
+            teamName =
+                teamName(
+                    player
+                ),
 
-        Log.d(
-            TAG,
-            "RESULTADO=$result"
+            competition =
+                entry
+                    .competition
+                    .label,
+
+            source =
+                "LALIGA"
         )
-
-        Log.d(
-            TAG,
-            "TEAM=${teamName(player)}"
-        )
-
-        Log.d(
-            TAG,
-            "STATS=$stats"
-        )
-
-        return result
     }
 
     // ============================================================
@@ -1166,7 +1348,8 @@ class LaLigaStatsRepository {
         var lastError:
             Exception? = null
 
-        repeat(2) { attempt ->
+        repeat(2) {
+            attempt ->
 
             try {
 
@@ -1241,7 +1424,7 @@ class LaLigaStatsRepository {
 
         connection.setRequestProperty(
             "User-Agent",
-            "Mozilla/5.0 (Android) FantasyCompanion/0.7"
+            "Mozilla/5.0 (Android) FantasyCompanion/0.8"
         )
 
         try {
@@ -1251,7 +1434,8 @@ class LaLigaStatsRepository {
 
             val stream =
                 if (
-                    code in 200..299
+                    code in
+                    200..299
                 ) {
 
                     connection.inputStream
@@ -1285,13 +1469,9 @@ class LaLigaStatsRepository {
                 "HTTP $code $url"
             )
 
-            Log.d(
-                TAG,
-                "BODY=${body.take(500)}"
-            )
-
             if (
-                code !in 200..299
+                code !in
+                200..299
             ) {
 
                 throw IllegalStateException(
@@ -1319,8 +1499,128 @@ class LaLigaStatsRepository {
     }
 
     // ============================================================
-    // UTILIDADES
+    // HELPERS
     // ============================================================
+
+    private fun playerCount():
+        Int {
+
+        val identities =
+            HashSet<String>()
+
+        playerIndex
+            .values
+            .forEach {
+                bucket ->
+
+                bucket.forEach {
+                    entry ->
+
+                    identities.add(
+                        playerIdentity(
+                            entry
+                        )
+                    )
+                }
+            }
+
+        return identities.size
+    }
+
+    private fun playerIdentity(
+        entry: IndexedPlayer
+    ): String {
+
+        val player =
+            entry.player
+
+        val opta =
+            player
+                .optString(
+                    "opta_id",
+                    ""
+                )
+                .trim()
+
+        if (
+            opta.isNotBlank()
+        ) {
+
+            return entry.competition.slug +
+                ":opta:" +
+                opta
+        }
+
+        val slug =
+            player
+                .optString(
+                    "slug",
+                    ""
+                )
+                .trim()
+
+        return entry.competition.slug +
+            ":" +
+            slug.ifBlank {
+
+                normalize(
+                    playerDisplayName(
+                        player
+                    )
+                )
+            }
+    }
+
+    private fun samePlayer(
+        a: JSONObject,
+        b: JSONObject
+    ): Boolean {
+
+        val optaA =
+            a
+                .optString(
+                    "opta_id",
+                    ""
+                )
+                .trim()
+
+        val optaB =
+            b
+                .optString(
+                    "opta_id",
+                    ""
+                )
+                .trim()
+
+        if (
+            optaA.isNotBlank() &&
+            optaB.isNotBlank()
+        ) {
+
+            return optaA ==
+                optaB
+        }
+
+        val slugA =
+            a
+                .optString(
+                    "slug",
+                    ""
+                )
+                .trim()
+
+        val slugB =
+            b
+                .optString(
+                    "slug",
+                    ""
+                )
+                .trim()
+
+        return slugA.isNotBlank() &&
+            slugA ==
+            slugB
+    }
 
     private fun playerDisplayName(
         player: JSONObject
@@ -1340,15 +1640,12 @@ class LaLigaStatsRepository {
             return name
         }
 
-        val nickname =
-            player
-                .optString(
-                    "nickname",
-                    ""
-                )
-                .trim()
-
-        return nickname
+        return player
+            .optString(
+                "nickname",
+                "Jugador"
+            )
+            .trim()
             .ifBlank {
                 "Jugador"
             }
@@ -1359,9 +1656,10 @@ class LaLigaStatsRepository {
     ): String {
 
         val team =
-            player.optJSONObject(
-                "team"
-            )
+            player
+                .optJSONObject(
+                    "team"
+                )
                 ?: return ""
 
         val nickname =
@@ -1385,24 +1683,6 @@ class LaLigaStatsRepository {
                 ""
             )
             .trim()
-    }
-
-    private fun jsonKeys(
-        obj: JSONObject
-    ): String {
-
-        val keys =
-            mutableListOf<String>()
-
-        obj.keys()
-            .forEachRemaining {
-
-                keys.add(
-                    it
-                )
-            }
-
-        return keys.joinToString()
     }
 
     private fun normalize(
